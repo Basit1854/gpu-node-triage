@@ -132,7 +132,11 @@ def check_kernel_log(findings):
 
 
 def check_device_presence(findings, expected):
-    """Step 2. lspci before nvidia-smi: a GPU off the bus hangs the driver tool."""
+    """Step 2. lspci before nvidia-smi: a GPU off the bus hangs the driver tool.
+
+    Returns True when nvidia-smi answered, which is what steps 3 and 4 need to
+    know before they spend another timeout on the same wedged driver.
+    """
     rc, out, err = run(["lspci"])
     bus_count = None
     if rc == 0:
@@ -161,11 +165,11 @@ def check_device_presence(findings, expected):
             "A wedged driver is itself the finding. Capture a bug report, "
             "then plan a reset window.",
         ))
-        return bus_count, None
+        return False
     if rc == -2:
         findings.append(Finding("presence", "info", "nvidia-smi not found", err,
                                 "no driver tooling on this host, so steps 3 and 4 cannot run", blocked=True))
-        return bus_count, None
+        return False
     if rc != 0:
         findings.append(Finding(
             "presence", "critical",
@@ -173,7 +177,7 @@ def check_device_presence(findings, expected):
             err.strip()[:300],
             "Compare against lspci: driver-visible count differs from bus count.",
         ))
-        return bus_count, None
+        return False
 
     driver_count = len([ln for ln in out.splitlines() if ln.startswith("GPU ")])
     if bus_count is not None and driver_count != bus_count:
@@ -189,7 +193,7 @@ def check_device_presence(findings, expected):
             f"driver sees {driver_count} GPUs, expected {expected}",
             "", "Capture evidence, then drain.",
         ))
-    return bus_count, driver_count
+    return True
 
 
 def _query(fields, timeout=20):
@@ -278,6 +282,8 @@ def check_nvlink(findings):
     """Step 4. Links down or error counters climbing."""
     rc, out, err = run(["nvidia-smi", "nvlink", "-s"], timeout=20)
     if rc == -2:
+        findings.append(Finding("nvlink", "info", "nvlink status unavailable",
+                                err, "", blocked=True))
         return
     if rc != 0:
         findings.append(Finding("nvlink", "info", "nvlink status unavailable", err,
@@ -433,9 +439,19 @@ def main():
 
     findings = []
     check_kernel_log(findings)
-    check_device_presence(findings, args.expect_gpus)
-    check_gpu_state(findings)
-    check_nvlink(findings)
+    driver_responding = check_device_presence(findings, args.expect_gpus)
+    if driver_responding:
+        check_gpu_state(findings)
+        check_nvlink(findings)
+    else:
+        # Step 2 already recorded why. Repeating the same call in steps 3 and 4
+        # buys nothing and costs another two timeouts on a node someone is
+        # waiting on.
+        for layer in ("gpu_state", "nvlink"):
+            findings.append(Finding(
+                layer, "info", "skipped: nvidia-smi is not usable on this host",
+                "", "See step 2.", blocked=True,
+            ))
     if not args.no_fabric:
         check_fabric(findings)
     if not args.no_oob:
