@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Stub nvidia-smi for testing the parsing paths without a GPU.
+#
+# FAKE_SCENARIO picks the fault being simulated. The point is to exercise the
+# csv and -q parsing against output shaped the way the real tool shapes it,
+# including the failure modes: an unsupported query field exits non-zero with
+# the fields that would have worked, and a wedged driver never returns at all.
+
+set -u
+: "${FAKE_SCENARIO:=healthy}"
+# The driver-visible count defaults to the bus count. Setting them apart is how
+# the "device is seated but the driver is not binding it" case gets tested.
+: "${FAKE_BUS_GPUS:=8}"
+: "${FAKE_DRIVER_GPUS:=$FAKE_BUS_GPUS}"
+
+args="$*"
+
+if [ "$FAKE_SCENARIO" = "hung" ]; then
+    sleep 300
+    exit 0
+fi
+
+case "$args" in
+  "-L")
+    i=0
+    while [ "$i" -lt "$FAKE_DRIVER_GPUS" ]; do
+        echo "GPU $i: NVIDIA H100 80GB HBM3 (UUID: GPU-0000000$i-0000-0000-0000-000000000000)"
+        i=$((i + 1))
+    done
+    ;;
+
+  *--query-gpu=*remapped_rows*)
+    case "$FAKE_SCENARIO" in pre_ampere|pre_ampere_fault)
+        # The real failure mode: one unrecognised field fails the whole query.
+        echo "Field \"remapped_rows.pending\" is not a valid field to query." >&2
+        exit 6 ;;
+    esac
+    for i in 0 1 2 3 4 5 6 7; do
+        if [ "$i" = "3" ] && [ "$FAKE_SCENARIO" = "remap_failure" ]; then
+            echo "$i, Yes, Yes, 12"
+        elif [ "$i" = "5" ] && [ "$FAKE_SCENARIO" = "remap_pending" ]; then
+            echo "$i, Yes, No, 4"
+        else
+            echo "$i, No, No, 0"
+        fi
+    done
+    ;;
+
+  *--query-gpu=*)
+    for i in 0 1 2 3 4 5 6 7; do
+        vol=0; agg=0; temp=41; hw="Not Active"; sw="Not Active"
+        case "$FAKE_SCENARIO" in
+          ecc_volatile) [ "$i" = "2" ] && { vol=1; agg=1; } ;;
+          ecc_aggregate) [ "$i" = "2" ] && agg=7 ;;
+          thermal) [ "$i" = "6" ] && { temp=91; hw="Active"; sw="Active"; } ;;
+          no_ecc_support) vol="N/A"; agg="N/A" ;;
+          pre_ampere) [ "$i" = "1" ] && agg=3 ;;
+        esac
+        echo "$i, $vol, $agg, $temp, $hw, $sw"
+    done
+    ;;
+
+  "-q -d ROW_REMAPPER")
+    echo "==============NVSMI LOG=============="
+    echo ""
+    echo "Attached GPUs                             : 8"
+    echo "GPU 00000000:1B:00.0"
+    echo "    Remapped Rows"
+    if [ "$FAKE_SCENARIO" = "pre_ampere_fault" ]; then
+        echo "        Pending                       : Yes"
+        echo "        Remapping Failure Occurred    : Yes"
+    else
+        echo "        Pending                       : No"
+        echo "        Remapping Failure Occurred    : No"
+    fi
+    ;;
+
+  "nvlink -s")
+    for i in 0 1 2 3 4 5 6 7; do
+        echo "GPU $i: NVIDIA H100 80GB HBM3"
+        for l in 0 1 2 3; do
+            if [ "$i" = "4" ] && [ "$l" = "2" ] && [ "$FAKE_SCENARIO" = "nvlink_down" ]; then
+                echo "         Link $l: <inactive>"
+            else
+                echo "         Link $l: 26.562 GB/s"
+            fi
+        done
+    done
+    ;;
+
+  *)
+    echo "stub: unhandled args: $args" >&2
+    exit 1
+    ;;
+esac

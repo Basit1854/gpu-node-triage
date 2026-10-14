@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stub lspci. FAKE_BUS_GPUS controls how many GPUs answer on the bus, so the
+# "device present on the bus but the driver is not binding it" case and the
+# "GPU fell off the bus" case can both be tested.
+set -u
+: "${FAKE_BUS_GPUS:=8}"
+
+echo "00:00.0 Host bridge: Intel Corporation Device 09a2"
+echo "00:1f.2 SATA controller: Intel Corporation C620 Series"
+i=0
+while [ "$i" -lt "$FAKE_BUS_GPUS" ]; do
+    printf '%02d:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)\n' "$((0x1b + i))"
+    i=$((i + 1))
+done
