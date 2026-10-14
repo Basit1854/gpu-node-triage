@@ -46,12 +46,17 @@ SEVERITY_ORDER = {"info": 0, "warn": 1, "critical": 2}
 
 
 class Finding:
-    def __init__(self, layer, severity, summary, detail="", next_step=""):
+    def __init__(self, layer, severity, summary, detail="", next_step="",
+                 blocked=False):
         self.layer = layer
         self.severity = severity
         self.summary = summary
         self.detail = detail
         self.next_step = next_step
+        # blocked means "this check did not run", which is not the same as
+        # "this check found nothing". Conflating the two is how a triage tool
+        # tells you a node is healthy when it never looked at it.
+        self.blocked = blocked
 
     def as_dict(self):
         return {
@@ -60,6 +65,7 @@ class Finding:
             "summary": self.summary,
             "detail": self.detail,
             "next_step": self.next_step,
+            "blocked": self.blocked,
         }
 
 
@@ -84,12 +90,14 @@ def check_kernel_log(findings):
     """Step 1. Passive, instant, and tells you which layer to look at next."""
     rc, out, err = run(["dmesg", "-T"], timeout=20)
     if rc == -2:
-        findings.append(Finding("kernel", "info", "dmesg unavailable", err))
+        findings.append(Finding("kernel", "info", "dmesg unavailable", err,
+                                "install util-linux, or read journalctl -k",
+                                blocked=True))
         return
     if rc != 0 and not out:
         findings.append(
             Finding("kernel", "info", "could not read kernel log", err,
-                    "retry with sudo, or use journalctl -k")
+                    "retry with sudo, or use journalctl -k", blocked=True)
         )
         return
 
@@ -141,7 +149,8 @@ def check_device_presence(findings, expected):
                 "inspection.",
             ))
     else:
-        findings.append(Finding("presence", "info", "lspci unavailable", err))
+        findings.append(Finding("presence", "info", "lspci unavailable", err,
+                                "install pciutils; the bus count is the only check that still answers when the driver is wedged", blocked=True))
 
     rc, out, err = run(["nvidia-smi", "-L"], timeout=20)
     if rc == -1:
@@ -154,7 +163,8 @@ def check_device_presence(findings, expected):
         ))
         return bus_count, None
     if rc == -2:
-        findings.append(Finding("presence", "info", "nvidia-smi not found", err))
+        findings.append(Finding("presence", "info", "nvidia-smi not found", err,
+                                "no driver tooling on this host, so steps 3 and 4 cannot run", blocked=True))
         return bus_count, None
     if rc != 0:
         findings.append(Finding(
@@ -211,6 +221,7 @@ def check_gpu_state(findings):
         findings.append(Finding(
             "gpu_state", "info", "could not query GPU state", "",
             "nvidia-smi -q -d ECC,ROW_REMAPPER,PERFORMANCE by hand.",
+            blocked=True,
         ))
     else:
         for r in rows:
@@ -269,7 +280,8 @@ def check_nvlink(findings):
     if rc == -2:
         return
     if rc != 0:
-        findings.append(Finding("nvlink", "info", "nvlink status unavailable", err))
+        findings.append(Finding("nvlink", "info", "nvlink status unavailable", err,
+                                "", blocked=True))
         return
     inactive = [ln.strip() for ln in out.splitlines() if "inactive" in ln.lower()]
     if inactive:
@@ -286,10 +298,12 @@ def check_fabric(findings):
     """Step 5. Move this first when the symptom is a hang or a slow multi-node job."""
     rc, out, err = run(["ibstat"], timeout=20)
     if rc == -2:
-        findings.append(Finding("fabric", "info", "ibstat not found", err))
+        findings.append(Finding("fabric", "info", "ibstat not found", err,
+                                "install infiniband-diags, or pass --no-fabric if this host has no fabric", blocked=True))
         return
     if rc != 0:
-        findings.append(Finding("fabric", "info", "ibstat returned an error", err))
+        findings.append(Finding("fabric", "info", "ibstat returned an error", err,
+                                "", blocked=True))
         return
 
     down = re.findall(r"State:\s*(\w+)", out)
@@ -317,10 +331,12 @@ def check_oob(findings):
     """Step 6. Events the OS never saw. Start here if the host is unresponsive."""
     rc, out, err = run(["ipmitool", "sel", "list", "last", "20"], timeout=25)
     if rc == -2:
-        findings.append(Finding("oob", "info", "ipmitool not found", err))
+        findings.append(Finding("oob", "info", "ipmitool not found", err,
+                                "install ipmitool, or pass --no-oob", blocked=True))
         return
     if rc != 0:
-        findings.append(Finding("oob", "info", "could not read BMC SEL", err))
+        findings.append(Finding("oob", "info", "could not read BMC SEL", err,
+                                "needs root or BMC credentials", blocked=True))
         return
     interesting = [
         ln for ln in out.splitlines()
@@ -346,13 +362,23 @@ LAYER_LABELS = [
 ]
 
 
+def exit_code(findings):
+    """1 if something needs a human, 2 if the sweep was incomplete, else 0.
+
+    A real finding outranks an incomplete sweep: if a check found an
+    uncorrectable ECC error, the missing ipmitool is not the headline.
+    """
+    if any(f.severity in ("warn", "critical") for f in findings):
+        return 1
+    if any(f.blocked for f in findings):
+        return 2
+    return 0
+
+
 def report(findings):
-    worst = "info"
     by_layer = {k: [] for k, _ in LAYER_LABELS}
     for f in findings:
         by_layer.setdefault(f.layer, []).append(f)
-        if SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[worst]:
-            worst = f.severity
 
     for key, label in LAYER_LABELS:
         items = by_layer.get(key, [])
@@ -362,6 +388,8 @@ def report(findings):
             continue
         for f in items:
             marker = {"info": "   ", "warn": " ! ", "critical": " X "}[f.severity]
+            if f.blocked:
+                marker = " ? "
             print(f"{marker}{f.summary}")
             if f.detail:
                 print(f"     {f.detail}")
@@ -370,14 +398,24 @@ def report(findings):
 
     print("\n" + "-" * 68)
     actionable = [f for f in findings if f.severity in ("warn", "critical")]
-    if not actionable:
-        print("No findings. If the symptom is real, compare against a healthy")
-        print("neighbour (step 9) before clearing the node.")
-    else:
+    blocked = [f for f in findings if f.blocked]
+
+    if actionable:
         print(f"{len(actionable)} finding(s) need a human.")
         print("Capture nvidia-bug-report.sh before anything that resets state,")
         print("then run the same sweep on a healthy node in the same rack.")
-    return worst
+        if blocked:
+            print(f"\n{len(blocked)} check(s) did not run, so this is not the "
+                  "whole picture.")
+    elif blocked:
+        names = ", ".join(sorted({f.layer for f in blocked}))
+        print(f"Sweep incomplete: {len(blocked)} check(s) could not run "
+              f"({names}).")
+        print("Nothing was found, but nothing was ruled out either. Fix the")
+        print("tooling or rerun with sudo before you clear this node.")
+    else:
+        print("No findings. If the symptom is real, compare against a healthy")
+        print("neighbour (step 9) before clearing the node.")
 
 
 def main():
@@ -404,13 +442,14 @@ def main():
         check_oob(findings)
 
     if args.json:
-        print(json.dumps([f.as_dict() for f in findings], indent=2))
-        worst = max((f.severity for f in findings),
-                    key=lambda s: SEVERITY_ORDER[s], default="info")
+        print(json.dumps({
+            "complete": not any(f.blocked for f in findings),
+            "findings": [f.as_dict() for f in findings],
+        }, indent=2))
     else:
-        worst = report(findings)
+        report(findings)
 
-    return 1 if worst in ("warn", "critical") else 0
+    return exit_code(findings)
 
 
 if __name__ == "__main__":
