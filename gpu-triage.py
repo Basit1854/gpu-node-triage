@@ -23,7 +23,11 @@ import sys
 # on a busy node returns pages of noise that nobody reads.
 KERNEL_PATTERNS = {
     "xid": r"NVRM: Xid \((?:[^)]*)\): (\d+)",
-    "nvrm": r"NVRM:",
+    # Not a bare "NVRM:". Every healthy node logs "NVRM: loading NVIDIA UNIX
+    # x86_64 Kernel Module" at boot, so the bare prefix flags the entire fleet
+    # and the output stops being read.
+    "nvrm": r"NVRM:.*(?:error|fail|timed out|timeout|unable|cannot|invalid|"
+            r"lost|reset)",
     "mlx5": r"mlx5_core.*(?:error|down|fail)",
     "pcie_aer": r"AER:.*(?:error|severity)",
     "nvme": r"nvme.*(?:I/O error|timeout|reset)",
@@ -107,32 +111,57 @@ def check_kernel_log(findings):
         )
         return
 
-    xids = sorted({int(m) for m in re.findall(KERNEL_PATTERNS["xid"], out)})
-    for xid in xids:
+    # Classify line by line rather than running each pattern over the whole
+    # buffer. Two reasons: an Xid line also matches the bare NVRM pattern, so
+    # whole-buffer counting reported every Xid twice, once properly and once as
+    # an anonymous "NVRM message"; and the example in the report should be the
+    # log line, not the fragment the regex happened to match. "example: NVRM:"
+    # is not worth printing.
+    xid_re = re.compile(KERNEL_PATTERNS["xid"])
+    other = [(name, re.compile(p, re.IGNORECASE))
+             for name, p in KERNEL_PATTERNS.items() if name != "xid"]
+
+    xids = {}
+    matched = {name: [] for name, _ in other}
+
+    for line in out.splitlines():
+        m = xid_re.search(line)
+        if m:
+            # Keep the first line for each code. A flapping link produces
+            # hundreds of identical Xid 74s and the count is the useful part.
+            xids.setdefault(int(m.group(1)), [line, 0])[1] += 1
+            continue
+        for name, pattern in other:
+            if pattern.search(line):
+                matched[name].append(line)
+                break
+
+    for xid in sorted(xids):
+        example, count = xids[xid]
+        seen = f"{count} occurrence(s). " if count > 1 else ""
         if xid in XID_HARDWARE:
             findings.append(Finding(
                 "kernel", "critical",
                 f"Xid {xid}: {XID_HARDWARE[xid]}",
-                "Hardware-class Xid present in the kernel log.",
+                f"{seen}{example.strip()[:200]}",
                 "Capture nvidia-bug-report.sh before any reset, then drain.",
             ))
         else:
             findings.append(Finding(
                 "kernel", "warn",
                 f"Xid {xid} present",
-                "Not in the hardware-class list; may be a workload fault.",
+                f"{seen}Not in the hardware-class list, so it may be a "
+                f"workload fault. {example.strip()[:160]}",
                 "Correlate the timestamp against the failing job.",
             ))
 
-    for name, pattern in KERNEL_PATTERNS.items():
-        if name == "xid":
-            continue
-        hits = re.findall(pattern, out, flags=re.IGNORECASE)
-        if hits:
+    for name, _ in other:
+        lines = matched[name]
+        if lines:
             findings.append(Finding(
                 "kernel", "warn",
-                f"{len(hits)} {name} message(s) in kernel log",
-                f"example: {hits[0][:160]}",
+                f"{len(lines)} {name} message(s) in kernel log",
+                f"most recent: {lines[-1].strip()[:200]}",
                 "Read the surrounding lines for timing against the symptom.",
             ))
 
@@ -226,6 +255,10 @@ def _query(fields):
     return rows
 
 
+def _plural(count, noun):
+    return noun if str(count) == "1" else noun + "s"
+
+
 def _positive(value):
     """True for a counter that is present and above zero.
 
@@ -270,14 +303,16 @@ def check_gpu_state(findings):
         if _positive(vol):
             findings.append(Finding(
                 "gpu_state", "critical",
-                f"GPU {idx}: {vol} uncorrectable ECC errors (volatile)",
+                f"GPU {idx}: {vol} uncorrectable ECC "
+                f"{_plural(vol, 'error')} (volatile)",
                 "Volatile counters reset on driver reload, so this is recent.",
                 "Capture a bug report before any reset clears it.",
             ))
         if _positive(agg) and not _positive(vol):
             findings.append(Finding(
                 "gpu_state", "warn",
-                f"GPU {idx}: {agg} uncorrectable ECC errors (aggregate only)",
+                f"GPU {idx}: {agg} uncorrectable ECC "
+                f"{_plural(agg, 'error')} (aggregate only)",
                 "A history of uncorrectable errors, nothing since the last "
                 "driver reload.",
                 "Note it against the node and compare with a healthy neighbour.",
@@ -462,7 +497,7 @@ def exit_code(findings):
     return 0
 
 
-def report(findings):
+def report(findings, skipped=frozenset()):
     by_layer = {k: [] for k, _ in LAYER_LABELS}
     for f in findings:
         by_layer.setdefault(f.layer, []).append(f)
@@ -470,6 +505,9 @@ def report(findings):
     for key, label in LAYER_LABELS:
         items = by_layer.get(key, [])
         print(f"\n{label}")
+        if key in skipped:
+            print("   not checked (disabled by flag)")
+            continue
         if not items:
             print("   nothing found")
             continue
@@ -524,6 +562,9 @@ def main():
     DEFAULT_TIMEOUT = args.timeout
 
     findings = []
+    # A check turned off by a flag is not a check that found nothing, and it is
+    # not a check that could not run either. Third case, said out loud.
+    skipped = set()
     check_kernel_log(findings)
     driver_responding = check_device_presence(findings, args.expect_gpus)
     if driver_responding:
@@ -538,18 +579,23 @@ def main():
                 layer, "info", "skipped: nvidia-smi is not usable on this host",
                 "", "See step 2.", blocked=True,
             ))
-    if not args.no_fabric:
+    if args.no_fabric:
+        skipped.add("fabric")
+    else:
         check_fabric(findings)
-    if not args.no_oob:
+    if args.no_oob:
+        skipped.add("oob")
+    else:
         check_oob(findings)
 
     if args.json:
         print(json.dumps({
             "complete": not any(f.blocked for f in findings),
+            "skipped_by_request": sorted(skipped),
             "findings": [f.as_dict() for f in findings],
         }, indent=2))
     else:
-        report(findings)
+        report(findings, skipped)
 
     return exit_code(findings)
 

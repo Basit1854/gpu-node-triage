@@ -21,12 +21,14 @@ SCRIPT = ROOT / "gpu-triage.py"
 FAKE_BIN = ROOT / "tests" / "fake-bin"
 
 
-def sweep(scenario="healthy", bus_gpus=8, extra_args=(), env_extra=None):
+def sweep(scenario="healthy", bus_gpus=8, extra_args=(), env_extra=None,
+          dmesg=None):
     """Run the script with the stubs on PATH. Returns (exit_code, findings)."""
     env = dict(os.environ)
     env["PATH"] = f"{FAKE_BIN}:{env.get('PATH', '')}"
     env["FAKE_SCENARIO"] = scenario
     env["FAKE_BUS_GPUS"] = str(bus_gpus)
+    env["FAKE_DMESG"] = dmesg or ""
     if env_extra:
         env.update(env_extra)
     p = subprocess.run(
@@ -58,6 +60,65 @@ class TestHealthyNode(unittest.TestCase):
         blocked = [f for f in findings if f["blocked"]]
         self.assertEqual(blocked, [], f"unexpected blocked checks: {blocked}")
         self.assertEqual(rc, 0)
+
+
+class TestKernelLog(unittest.TestCase):
+    def test_hardware_xid_is_critical_and_quotes_the_line(self):
+        rc, findings = sweep(dmesg="xid48-ecc.log")
+        self.assertEqual(rc, 1)
+        hits = [f for f in findings if f["summary"].startswith("Xid 48")]
+        self.assertTrue(hits, summaries(findings, "kernel"))
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertIn("double bit error", hits[0]["detail"])
+
+    def test_repeated_xids_collapse_into_one_finding_with_a_count(self):
+        # A flapping link produces hundreds of identical Xid 74s. One finding
+        # that says how many beats hundreds of findings.
+        rc, findings = sweep(dmesg="xid48-ecc.log")
+        self.assertEqual(len([f for f in findings
+                              if f["summary"].startswith("Xid 48")]), 1)
+        detail = [f["detail"] for f in findings
+                  if f["summary"].startswith("Xid 48")][0]
+        self.assertIn("2 occurrence(s)", detail)
+
+    def test_an_xid_line_is_not_also_counted_as_a_generic_nvrm_message(self):
+        # The bare NVRM pattern matched every Xid line, so each one was
+        # reported twice: once properly, once as an anonymous NVRM message.
+        rc, findings = sweep(dmesg="xid48-ecc.log")
+        self.assertEqual(
+            [s for s in summaries(findings, "kernel") if "nvrm message" in s],
+            [],
+        )
+
+    def test_workload_xid_is_a_warning_not_a_critical(self):
+        # Xid 13 is a graphics exception, which is usually the customer's
+        # kernel, not the board. Draining a node for it wastes capacity.
+        rc, findings = sweep(dmesg="xid13-workload.log")
+        self.assertEqual(summaries(findings, "kernel", "critical"), [])
+        self.assertIn("Xid 13 present", summaries(findings, "kernel", "warn"))
+
+    def test_the_driver_load_banner_is_not_a_finding(self):
+        # Every healthy node logs "NVRM: loading NVIDIA UNIX x86_64 Kernel
+        # Module" at boot. A pattern that flags the whole fleet gets ignored.
+        rc, findings = sweep()
+        self.assertEqual(summaries(findings, "kernel"), [])
+        self.assertEqual(rc, 0)
+
+    def test_fabric_errors_in_the_kernel_log_are_surfaced(self):
+        rc, findings = sweep(dmesg="fabric-flap.log")
+        self.assertEqual(rc, 1)
+        self.assertTrue(
+            any("mlx5 message" in s for s in summaries(findings, "kernel")),
+            summaries(findings, "kernel"),
+        )
+
+    def test_pcie_errors_and_a_fallen_gpu_are_both_reported(self):
+        # The AER corrected errors come first and the Xid 79 comes five minutes
+        # later. Reading one without the other loses the story.
+        rc, findings = sweep(dmesg="pcie-aer.log")
+        labels = summaries(findings, "kernel")
+        self.assertTrue(any("Xid 79" in s for s in labels), labels)
+        self.assertTrue(any("pcie_aer message" in s for s in labels), labels)
 
 
 class TestDevicePresence(unittest.TestCase):

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stub dmesg. FAKE_DMESG names a fixture under tests/fixtures; unset means a
+# clean log. Real lines, trimmed, because the Xid format is the thing being
+# parsed and paraphrasing it defeats the point of the test.
+set -u
+: "${FAKE_DMESG:=}"
+
+here="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -z "$FAKE_DMESG" ]; then
+    echo "[Mon Oct 13 09:14:02 2026] Linux version 5.15.0-91-generic"
+    echo "[Mon Oct 13 09:14:03 2026] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.54.15"
+    exit 0
+fi
+
+cat "$here/../fixtures/$FAKE_DMESG"
