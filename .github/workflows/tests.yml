@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.8 is what a lot of GPU nodes are still on, because the OS Python
+        # is whatever the base image shipped and nobody upgrades it on a host
+        # that is busy earning money. If this breaks on 3.8 it is useless.
+        python-version: ["3.8", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Check it imports and parses
+        run: python -m py_compile gpu-triage.py
+      - name: Check the stubs are valid shell
+        run: |
+          for f in tests/fake-bin/*; do bash -n "$f"; done
+      - name: Run the suite
+        run: python tests/test_triage.py
+      - name: Confirm an incomplete sweep does not report a healthy node
+        run: |
+          set +e
+          PATH=/nonexistent python gpu-triage.py --json > /dev/null
+          code=$?
+          set -e
+          if [ "$code" != "2" ]; then
+            echo "expected exit 2 for an incomplete sweep, got $code"
+            exit 1
+          fi
