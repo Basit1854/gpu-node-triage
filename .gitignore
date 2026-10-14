@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.log
+bug-report-*.gz
+nvidia-bug-report.log.gz
