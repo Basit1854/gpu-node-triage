@@ -1,0 +1,4 @@
+[Mon Oct 13 09:14:03 2026] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.54.15
+[Mon Oct 13 14:02:11 2026] NVRM: Xid (PCI:0000:1b:00): 48, pid=1, name=nvidia-smi, An uncorrectable double bit error (DBE) has been detected on GPU in the framebuffer at partition 3, subpartition 0.
+[Mon Oct 13 14:02:11 2026] NVRM: Xid (PCI:0000:1b:00): 48, pid=1, name=nvidia-smi, An uncorrectable double bit error (DBE) has been detected on GPU in the framebuffer at partition 3, subpartition 0.
+[Mon Oct 13 14:02:12 2026] NVRM: Xid (PCI:0000:1b:00): 63, pid=1, name=nvidia-smi, Row Remapper: New row marked for remapping, reset gpu to activate.

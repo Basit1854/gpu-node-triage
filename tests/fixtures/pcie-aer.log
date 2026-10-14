@@ -1,0 +1,4 @@
+[Mon Oct 13 09:14:03 2026] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.54.15
+[Mon Oct 13 13:04:55 2026] pcieport 0000:17:00.0: AER: Corrected error received: 0000:1b:00.0
+[Mon Oct 13 13:04:55 2026] nvidia 0000:1b:00.0: AER: PCIe Bus Error: severity=Corrected, type=Data Link Layer, (Receiver ID)
+[Mon Oct 13 13:09:02 2026] NVRM: Xid (PCI:0000:1b:00): 79, GPU has fallen off the bus.

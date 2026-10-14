@@ -1,0 +1,4 @@
+[Mon Oct 13 09:14:03 2026] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.54.15
+[Mon Oct 13 11:20:04 2026] mlx5_core 0000:a1:00.0: mlx5_health_error_handler:main:(pid 0): Fatal error 1 detected
+[Mon Oct 13 11:20:05 2026] mlx5_core 0000:a1:00.0 ibp161s0: Link down
+[Mon Oct 13 11:20:19 2026] mlx5_core 0000:a1:00.0 ibp161s0: Link down

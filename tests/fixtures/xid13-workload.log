@@ -1,0 +1,2 @@
+[Mon Oct 13 09:14:03 2026] NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.54.15
+[Mon Oct 13 15:31:40 2026] NVRM: Xid (PCI:0000:3d:00): 13, pid=48122, name=python3, Graphics Exception: ChID 0010, Class 0000c797, Offset 00000000, Data 00000000

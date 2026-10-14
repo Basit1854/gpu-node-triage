@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
-*.log
-bug-report-*.gz
+
+# Bug reports and captured logs land next to wherever the script was run.
+# Scoped deliberately: a blanket *.log also swallowed tests/fixtures, which
+# are checked-in test data, and the tests passed locally while failing in a
+# fresh clone.
 nvidia-bug-report.log.gz
+bug-report-*.gz
+/*.log
