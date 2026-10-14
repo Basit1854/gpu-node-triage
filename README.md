@@ -50,9 +50,13 @@ rack is what separates a real fault from a number you have not seen.
 
 ## What the script does
 
-`gpu-triage.py` runs **steps 1 through 6, read-only**. It will not cordon, will
-not reset, will not run `dcgmi diag`, and will not reboot anything. Those are
-decisions for a human with context, and two of them destroy evidence.
+`gpu-triage.py` runs **steps 1 through 6, read-only**, with no dependencies
+outside the Python standard library, because installing packages on a suspect
+node is not triage.
+
+It will not cordon, will not reset, will not run `dcgmi diag`, and will not
+reboot anything. Those are decisions for a human with context, and two of them
+destroy evidence.
 
 ```bash
 # default: read-only sweep, human-readable output
@@ -66,37 +70,83 @@ sudo ./gpu-triage.py --json
 
 # skip the fabric checks on a single-node box
 sudo ./gpu-triage.py --no-fabric
+
+# a loaded node answers slowly; a rack sweep cannot wait 20s per command
+sudo ./gpu-triage.py --timeout 45
 ```
 
-It exits `0` when nothing was found, `1` when something needs a human, and `2`
-when it could not complete the sweep (missing tooling, insufficient privileges).
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Every check ran and found nothing. |
+| `1` | Something needs a human. |
+| `2` | The sweep could not complete: missing tooling or insufficient privileges. |
+
+`2` matters more than it looks. A check that could not run is not a check that
+found nothing, and anything wrapping this in a health check needs to tell those
+apart. Missing `nvidia-smi` used to print "nvidia-smi not found" and then
+conclude "No findings", exit `0`, which reads as a clean node to everything
+downstream.
+
+A real finding outranks an incomplete sweep: if there is an uncorrectable ECC
+error, a missing `ipmitool` is not the headline, so that case exits `1` and says
+separately that some checks were skipped.
 
 Output is grouped by layer, in the order above, with a short verdict at the end
 naming the next step rather than the conclusion. "Xid 48 present, GPU 3,
-double-bit ECC — capture a bug report, then drain" is useful. "Node unhealthy"
-is not.
+double-bit ECC, capture a bug report then drain" is useful. "Node unhealthy" is
+not.
 
 ### Design decisions worth naming
 
-**`nvidia-smi` is called with a timeout.** A wedged driver hangs it, and a triage
-tool that hangs is worse than no tool. Timeout is treated as a finding, not an
-error.
+**Every external command has a timeout.** A wedged driver hangs `nvidia-smi`,
+and a triage tool that hangs is worse than no tool. A timeout is reported as a
+finding, not an error: a driver that will not answer is itself the answer.
+
+**The driver is probed once.** Step 2 establishes whether `nvidia-smi` responds,
+and steps 3 and 4 run only if it did. They used to call it again regardless, so
+one hung node cost three timeouts while somebody waited on the output.
 
 **Nothing is parsed from `nvidia-smi` table output.** The human-readable table
-changes between driver versions. `-q` with explicit fields, or
-`--query-gpu=... --format=csv`, is stable.
+changes between driver versions. `--query-gpu` with explicit fields is stable.
+
+**Query fields are grouped by generation support.** `--query-gpu` is
+all-or-nothing: one field the installed driver does not recognise and the whole
+query exits non-zero, taking the fields that would have worked alongside it. ECC
+and thermals answer everywhere; `remapped_rows` is Ampere and later. Asked for
+together, a V100 loses all of step 3.
 
 **Volatile and aggregate ECC counters are reported separately.** Volatile resets
-on driver reload; aggregate does not. A node with aggregate errors and clean
-volatile counters has a history worth knowing about.
+on driver reload, aggregate does not. Errors in aggregate alone are history
+rather than something happening now, which is a different conversation, so that
+case is a warning and not a critical.
 
-**Row remapping is checked, not just ECC.** `remapping_pending` means the GPU
-wants a reset to apply a remap. `remapping_failure` means it tried and could not,
-which is an RMA conversation.
+**Row remapping is checked, and it is not page retirement.** Row remapping
+replaced page retirement on A100 and later, so `retired_pages.pending` returns
+`N/A` on anything current. Pending means the GPU wants a reset to apply a remap,
+which is a maintenance window. Failure means it tried and could not, which is an
+RMA. Reporting them together sends working boards back to the vendor.
 
 **Severity is advisory.** The script flags and explains; it does not decide.
 Deciding needs the comparison in step 9 and knowledge of what the customer is
 running.
+
+---
+
+## Tests
+
+```bash
+python3 tests/test_triage.py
+```
+
+There is no GPU on a laptop or a CI runner, so the tests put stub `nvidia-smi`
+and `lspci` binaries ahead of the real ones on `PATH` and shape their output the
+way the real tools shape it. The stubs in `tests/fake-bin` are the interesting
+half: they reproduce the failure modes that are easy to get wrong by reasoning
+about them rather than observing them, including an unsupported query field
+exiting non-zero instead of returning `N/A`, and a driver that never returns at
+all.
 
 ---
 
