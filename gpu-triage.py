@@ -44,6 +44,11 @@ XID_HARDWARE = {
 
 SEVERITY_ORDER = {"info": 0, "warn": 1, "critical": 2}
 
+# Seconds to wait on any external command before calling it hung. Long enough
+# that a merely busy node is not reported as wedged, short enough that a sweep
+# across a rack does not stall. --timeout overrides it.
+DEFAULT_TIMEOUT = 20
+
 
 class Finding:
     def __init__(self, layer, severity, summary, detail="", next_step="",
@@ -69,12 +74,13 @@ class Finding:
         }
 
 
-def run(cmd, timeout=15):
+def run(cmd, timeout=None):
     """Run a command. Returns (rc, stdout, stderr). rc of -1 means timeout.
 
     nvidia-smi hangs when the driver is wedged, so everything gets a timeout and
     a timeout is treated as a finding rather than an error.
     """
+    timeout = DEFAULT_TIMEOUT if timeout is None else timeout
     if not shutil.which(cmd[0]):
         return (-2, "", f"{cmd[0]} not found")
     try:
@@ -88,7 +94,7 @@ def run(cmd, timeout=15):
 
 def check_kernel_log(findings):
     """Step 1. Passive, instant, and tells you which layer to look at next."""
-    rc, out, err = run(["dmesg", "-T"], timeout=20)
+    rc, out, err = run(["dmesg", "-T"])
     if rc == -2:
         findings.append(Finding("kernel", "info", "dmesg unavailable", err,
                                 "install util-linux, or read journalctl -k",
@@ -156,7 +162,7 @@ def check_device_presence(findings, expected):
         findings.append(Finding("presence", "info", "lspci unavailable", err,
                                 "install pciutils; the bus count is the only check that still answers when the driver is wedged", blocked=True))
 
-    rc, out, err = run(["nvidia-smi", "-L"], timeout=20)
+    rc, out, err = run(["nvidia-smi", "-L"])
     if rc == -1:
         findings.append(Finding(
             "presence", "critical",
@@ -196,91 +202,166 @@ def check_device_presence(findings, expected):
     return True
 
 
-def _query(fields, timeout=20):
-    """nvidia-smi --query-gpu is stable across driver versions. The table is not."""
-    rc, out, err = run(
+def _query(fields):
+    """Query named fields. Returns a list of dicts keyed by field name.
+
+    --query-gpu is stable across driver versions where the human-readable
+    table is not. The catch is that it is all-or-nothing: one field the
+    installed driver does not recognise and the whole query exits non-zero
+    with "Field is not a valid field to query", taking the fields that would
+    have worked with it. So the caller asks for one group at a time.
+    """
+    rc, out, _ = run(
         ["nvidia-smi", f"--query-gpu={','.join(fields)}",
-         "--format=csv,noheader,nounits"], timeout=timeout
+         "--format=csv,noheader,nounits"]
     )
     if rc != 0:
         return None
     rows = []
     for line in out.strip().splitlines():
-        rows.append([c.strip() for c in line.split(",")])
+        cells = [c.strip() for c in line.split(",")]
+        if len(cells) != len(fields):
+            continue
+        rows.append(dict(zip(fields, cells)))
     return rows
 
 
+def _positive(value):
+    """True for a counter that is present and above zero.
+
+    Unsupported counters come back as "N/A" or "[N/A]" rather than an error,
+    and "0" is the common case, so neither should be mistaken for a fault.
+    """
+    return value.isdigit() and int(value) > 0
+
+
+# Split by generation support, not by subject matter. ECC and thermals answer
+# everywhere; remapped_rows is Ampere and later, and asking for it on a V100
+# would fail the ECC fields sitting next to it.
+CORE_FIELDS = [
+    "index",
+    "ecc.errors.uncorrected.volatile.total",
+    "ecc.errors.uncorrected.aggregate.total",
+    "temperature.gpu",
+    "clocks_throttle_reasons.hw_slowdown",
+    "clocks_throttle_reasons.sw_thermal_slowdown",
+]
+REMAP_FIELDS = [
+    "index",
+    "remapped_rows.pending",
+    "remapped_rows.failure",
+    "remapped_rows.uncorrectable",
+]
+
+
 def check_gpu_state(findings):
-    """Step 3. ECC, row remapping, throttling, thermals, power."""
-    rows = _query([
-        "index",
-        "ecc.errors.uncorrected.volatile.total",
-        "ecc.errors.uncorrected.aggregate.total",
-        "retired_pages.pending",
-        "temperature.gpu",
-        "clocks_throttle_reasons.hw_slowdown",
-        "clocks_throttle_reasons.sw_thermal_slowdown",
-    ])
+    """Step 3. ECC, row remapping, throttling, thermals."""
+    rows = _query(CORE_FIELDS)
     if rows is None:
         findings.append(Finding(
-            "gpu_state", "info", "could not query GPU state", "",
-            "nvidia-smi -q -d ECC,ROW_REMAPPER,PERFORMANCE by hand.",
+            "gpu_state", "info", "could not query ECC and thermal state", "",
+            "nvidia-smi -q -d ECC,PERFORMANCE,TEMPERATURE by hand.",
             blocked=True,
         ))
-    else:
-        for r in rows:
-            idx = r[0]
-            vol, agg, pending = r[1], r[2], r[3]
-            if vol.isdigit() and int(vol) > 0:
-                findings.append(Finding(
-                    "gpu_state", "critical",
-                    f"GPU {idx}: {vol} uncorrectable ECC errors (volatile)",
-                    "Volatile counters reset on driver reload, so this is recent.",
-                    "Capture a bug report before any reset clears it.",
-                ))
-            if agg.isdigit() and int(agg) > 0 and vol in ("0", "N/A"):
-                findings.append(Finding(
-                    "gpu_state", "warn",
-                    f"GPU {idx}: {agg} uncorrectable ECC errors (aggregate only)",
-                    "History of uncorrectable errors, nothing since last reload.",
-                    "Note it against the node; compare with a healthy neighbour.",
-                ))
-            if pending not in ("0", "N/A", ""):
-                findings.append(Finding(
-                    "gpu_state", "warn",
-                    f"GPU {idx}: {pending} retired pages pending",
-                    "A reset is needed to apply the retirement.",
-                    "Schedule a reset window; do not reset mid-job.",
-                ))
-            if len(r) > 5 and r[5] == "Active":
-                findings.append(Finding(
-                    "gpu_state", "warn",
-                    f"GPU {idx}: hardware slowdown active",
-                    f"temperature {r[4]}C",
-                    "Thermal or power event. Check BMC SEL and inlet temps.",
-                ))
-
-    # Row remapping lives in -q output, not the query interface.
-    rc, out, _ = run(["nvidia-smi", "-q", "-d", "ROW_REMAPPER"], timeout=20)
-    if rc == 0:
-        if re.search(r"Remapping Failure Occurred\s*:\s*Yes", out):
+    for r in rows or []:
+        idx = r["index"]
+        vol = r["ecc.errors.uncorrected.volatile.total"]
+        agg = r["ecc.errors.uncorrected.aggregate.total"]
+        if _positive(vol):
             findings.append(Finding(
                 "gpu_state", "critical",
-                "row remapping failure occurred",
-                "The GPU attempted a remap and could not complete it.",
-                "Capture evidence and open an RMA.",
+                f"GPU {idx}: {vol} uncorrectable ECC errors (volatile)",
+                "Volatile counters reset on driver reload, so this is recent.",
+                "Capture a bug report before any reset clears it.",
             ))
-        if re.search(r"Pending\s*:\s*Yes", out):
+        if _positive(agg) and not _positive(vol):
             findings.append(Finding(
                 "gpu_state", "warn",
-                "row remapping pending",
-                "", "Reset required to apply. Schedule a window.",
+                f"GPU {idx}: {agg} uncorrectable ECC errors (aggregate only)",
+                "A history of uncorrectable errors, nothing since the last "
+                "driver reload.",
+                "Note it against the node and compare with a healthy neighbour.",
             ))
+        for field, label in (
+            ("clocks_throttle_reasons.hw_slowdown", "hardware slowdown"),
+            ("clocks_throttle_reasons.sw_thermal_slowdown",
+             "software thermal slowdown"),
+        ):
+            if r[field] == "Active":
+                findings.append(Finding(
+                    "gpu_state", "warn",
+                    f"GPU {idx}: {label} active",
+                    f"temperature {r['temperature.gpu']}C",
+                    "Thermal or power event. Check the BMC SEL and inlet temps.",
+                ))
+
+    _check_row_remapping(findings)
+
+
+def _check_row_remapping(findings):
+    """Row remapping is Ampere and later, and it is not the same as ECC.
+
+    A pending remap means the GPU wants a reset to apply one. A failure means
+    it tried and could not, which is an RMA conversation rather than a reset.
+    """
+    rows = _query(REMAP_FIELDS)
+    if rows is not None:
+        for r in rows:
+            idx = r["index"]
+            if r["remapped_rows.failure"] in ("Yes", "1"):
+                findings.append(Finding(
+                    "gpu_state", "critical",
+                    f"GPU {idx}: row remapping failure",
+                    "The GPU attempted a remap and could not complete it.",
+                    "Capture evidence and open an RMA.",
+                ))
+            if r["remapped_rows.pending"] in ("Yes", "1"):
+                findings.append(Finding(
+                    "gpu_state", "warn",
+                    f"GPU {idx}: row remap pending",
+                    "A reset is needed to apply it.",
+                    "Schedule a reset window; do not reset mid-job.",
+                ))
+            if _positive(r["remapped_rows.uncorrectable"]):
+                findings.append(Finding(
+                    "gpu_state", "warn",
+                    f"GPU {idx}: {r['remapped_rows.uncorrectable']} rows "
+                    "remapped from uncorrectable errors",
+                    "Remapping is finite. A climbing count is a dying board.",
+                    "Trend it against the rest of the fleet.",
+                ))
+        return
+
+    # Pre-Ampere, or a driver that does not expose the fields. Fall back to the
+    # -q section, which does not report per-GPU in a form worth parsing, so
+    # this only answers whether the node has a problem at all.
+    rc, out, _ = run(["nvidia-smi", "-q", "-d", "ROW_REMAPPER"])
+    if rc != 0:
+        findings.append(Finding(
+            "gpu_state", "info", "could not read row remapping state", "",
+            "Expected on pre-Ampere hardware, where page retirement applies "
+            "instead: nvidia-smi -q -d PAGE_RETIREMENT.",
+            blocked=True,
+        ))
+        return
+    if re.search(r"Remapping Failure Occurred\s*:\s*Yes", out):
+        findings.append(Finding(
+            "gpu_state", "critical",
+            "row remapping failure on at least one GPU",
+            "The GPU attempted a remap and could not complete it.",
+            "nvidia-smi -q -d ROW_REMAPPER to find which, then open an RMA.",
+        ))
+    if re.search(r"Pending\s*:\s*Yes", out):
+        findings.append(Finding(
+            "gpu_state", "warn",
+            "row remap pending on at least one GPU",
+            "", "Reset required to apply. Schedule a window.",
+        ))
 
 
 def check_nvlink(findings):
     """Step 4. Links down or error counters climbing."""
-    rc, out, err = run(["nvidia-smi", "nvlink", "-s"], timeout=20)
+    rc, out, err = run(["nvidia-smi", "nvlink", "-s"])
     if rc == -2:
         findings.append(Finding("nvlink", "info", "nvlink status unavailable",
                                 err, "", blocked=True))
@@ -302,7 +383,7 @@ def check_nvlink(findings):
 
 def check_fabric(findings):
     """Step 5. Move this first when the symptom is a hang or a slow multi-node job."""
-    rc, out, err = run(["ibstat"], timeout=20)
+    rc, out, err = run(["ibstat"])
     if rc == -2:
         findings.append(Finding("fabric", "info", "ibstat not found", err,
                                 "install infiniband-diags, or pass --no-fabric if this host has no fabric", blocked=True))
@@ -335,7 +416,7 @@ def check_fabric(findings):
 
 def check_oob(findings):
     """Step 6. Events the OS never saw. Start here if the host is unresponsive."""
-    rc, out, err = run(["ipmitool", "sel", "list", "last", "20"], timeout=25)
+    rc, out, err = run(["ipmitool", "sel", "list", "last", "20"])
     if rc == -2:
         findings.append(Finding("oob", "info", "ipmitool not found", err,
                                 "install ipmitool, or pass --no-oob", blocked=True))
@@ -425,6 +506,7 @@ def report(findings):
 
 
 def main():
+    global DEFAULT_TIMEOUT
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--expect-gpus", type=int, default=8,
@@ -435,7 +517,11 @@ def main():
                     help="skip BMC SEL checks")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable output")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                    help=f"seconds before a command is called hung "
+                         f"(default {DEFAULT_TIMEOUT})")
     args = ap.parse_args()
+    DEFAULT_TIMEOUT = args.timeout
 
     findings = []
     check_kernel_log(findings)
