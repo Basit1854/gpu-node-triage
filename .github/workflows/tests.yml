@@ -28,8 +28,12 @@ jobs:
         run: python tests/test_triage.py
       - name: Confirm an incomplete sweep does not report a healthy node
         run: |
+          # Resolve the interpreter before blanking PATH. Setting PATH for the
+          # whole command hides python itself, and the step then measures
+          # "python is missing" (127) rather than the thing it is checking.
+          PY=$(which python)
           set +e
-          PATH=/nonexistent python gpu-triage.py --json > /dev/null
+          PATH=/nonexistent "$PY" gpu-triage.py --json > /dev/null
           code=$?
           set -e
           if [ "$code" != "2" ]; then
